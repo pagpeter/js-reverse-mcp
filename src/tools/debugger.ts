@@ -1244,6 +1244,120 @@ export const setBreakpointOnText = defineTool({
 });
 
 /**
+ * Logpoint: a non-pausing breakpoint that emits a console.log of a user
+ * expression every time the location is hit. Implemented by setting a
+ * conditional breakpoint whose condition is `console.log(prefix +
+ * JSON.stringify(<expr>)), false` -- the comma operator runs the log side
+ * effect then returns false so the debugger never pauses. Hits are read via
+ * the existing list_console_messages tool (filter by the prefix).
+ *
+ * This solves the "conditional breakpoints fail silently" problem: instead
+ * of writing to a window global (which lives in a sandbox the debugger can't
+ * always reach), we route through console.log which the MCP already collects
+ * end-to-end. If the expression itself errors, the error message is captured
+ * just like any other console error.
+ */
+export const setLogpoint = defineTool({
+  name: 'set_logpoint',
+  description: `Set a non-pausing logpoint at a code location. Every time the location is hit, the given expression is evaluated in the paused frame's scope and JSON.stringify'd into the console as "<tag> <json>". Read with list_console_messages and filter by tag. This is the right tool for "I want to watch what value gets passed here without halting execution" — much more reliable than conditional breakpoints with window-global side effects, because console output survives sandbox boundaries.`,
+  annotations: {
+    title: 'Set Logpoint',
+    category: ToolCategory.REVERSE_ENGINEERING,
+    readOnlyHint: false,
+  },
+  schema: {
+    text: zod
+      .string()
+      .describe(
+        'The code text to find and set logpoint on (same matching as set_breakpoint_on_text).',
+      ),
+    expression: zod
+      .string()
+      .describe(
+        'JS expression evaluated each hit. Anything in scope at the hit location is accessible (function args, closure vars, etc). Example: "{key: tC, plain: Array.from(S).slice(0,8), len: S.length}".',
+      ),
+    tag: zod
+      .string()
+      .optional()
+      .default('LOGPOINT')
+      .describe(
+        'Prefix tag included in every emitted console message so multiple logpoints can coexist. Default: "LOGPOINT".',
+      ),
+    urlFilter: zod
+      .string()
+      .optional()
+      .describe(
+        'Only search in scripts whose URL contains this string (case-insensitive).',
+      ),
+    occurrence: zod
+      .number()
+      .int()
+      .optional()
+      .default(1)
+      .describe('Which occurrence to attach to (1 = first).'),
+  },
+  handler: async (request, response, context) => {
+    const debugger_ = context.debuggerContext;
+    if (!debugger_.isEnabled()) {
+      response.appendResponseLine('Debugger is not enabled. Please select a page first.');
+      return;
+    }
+    const {text, expression, tag, urlFilter, occurrence} = request.params;
+
+    // Build a condition that logs and returns false. We wrap the expression
+    // in a try/catch so a referenceerror at one hit doesn't kill subsequent
+    // hits; errors are surfaced into the same console stream so they're
+    // visible without polling for breakpoint-condition diagnostics.
+    const condition = `(()=>{try{console.log(${JSON.stringify(tag + ' ')}+JSON.stringify(${expression}))}catch(e){console.error(${JSON.stringify(tag + ' <err> ')}+e)}return false})()`;
+
+    try {
+      const searchResult = await debugger_.searchInScripts(text, {
+        caseSensitive: true,
+        isRegex: false,
+      });
+      let matches = searchResult.matches;
+      if (urlFilter) {
+        const f = urlFilter.toLowerCase();
+        matches = matches.filter(m => m.url && m.url.toLowerCase().includes(f));
+      }
+      if (matches.length === 0) {
+        response.appendResponseLine(`"${text}" not found${urlFilter ? ` matching "${urlFilter}"` : ''}.`);
+        return;
+      }
+      if (occurrence > matches.length) {
+        response.appendResponseLine(`Only ${matches.length} occurrence(s) found, but occurrence ${occurrence} requested.`);
+        return;
+      }
+      const match = matches[occurrence - 1];
+      const script = debugger_.getScriptById(match.scriptId);
+      const url = script?.url || match.url;
+      if (!url) {
+        response.appendResponseLine('Cannot set logpoint: script has no URL (inline).');
+        return;
+      }
+      const result = await debugger_.getScriptSource(match.scriptId);
+      const lines = result.scriptSource.split('\n');
+      let columnNumber = 0;
+      if (match.lineNumber < lines.length) {
+        const colPos = lines[match.lineNumber].indexOf(text);
+        if (colPos >= 0) columnNumber = colPos;
+      }
+      const breakpointInfo = await debugger_.setBreakpoint(url, match.lineNumber, columnNumber, condition);
+      response.appendResponseLine(`✅ Logpoint set!`);
+      response.appendResponseLine(`- ID: ${breakpointInfo.breakpointId}`);
+      response.appendResponseLine(`- URL: ${url}`);
+      response.appendResponseLine(`- Line: ${match.lineNumber + 1}, Column: ${columnNumber}`);
+      response.appendResponseLine(`- Tag: ${tag}`);
+      response.appendResponseLine(`- Expression: ${expression}`);
+      response.appendResponseLine('');
+      response.appendResponseLine(`Read hits with: list_console_messages, then filter for "${tag} ".`);
+    } catch (e) {
+      response.appendResponseLine(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  },
+});
+
+/**
  * Set XHR/Fetch breakpoint.
  */
 export const breakOnXhr = defineTool({

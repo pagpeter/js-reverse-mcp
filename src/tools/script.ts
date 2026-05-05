@@ -263,3 +263,93 @@ Example with arguments: \`(el) => {
     }
   },
 });
+
+// evaluate_in_worker fills the gap that's most painful for v3 reCAPTCHA /
+// antibot reverse engineering: the env_proto serialization, LCG cipher, and
+// most other "interesting" code runs in a Web Worker, not the page main
+// thread. evaluate_script can't see that scope. This tool lists workers,
+// optionally filters by URL substring, and evaluates a function in the
+// chosen worker context.
+export const evaluateInWorker = defineTool({
+  name: 'evaluate_in_worker',
+  description: `Evaluate a JS function inside a Web Worker on the selected page. Use this when the code you care about runs in a worker (reCAPTCHA env_proto serialization + LCG cipher, many antibot SDKs, service workers etc) — evaluate_script's main/isolated worlds don't reach worker scope. Pass workerUrlFilter to pick a specific worker by URL substring; otherwise the first worker is used. Lists available workers when no function is supplied.`,
+  annotations: {
+    category: ToolCategory.DEBUGGING,
+    readOnlyHint: false,
+  },
+  schema: {
+    function: zod
+      .string()
+      .optional()
+      .describe(
+        'JS function to run in the worker. Same shape as evaluate_script\'s function. If omitted, returns the list of currently attached workers.',
+      ),
+    workerUrlFilter: zod
+      .string()
+      .optional()
+      .describe(
+        'Substring matched against worker URLs (case-insensitive). When omitted and multiple workers exist, the first is used and a warning printed.',
+      ),
+  },
+  handler: async (request, response, context) => {
+    const {function: fnString, workerUrlFilter} = request.params;
+    const page = context.getSelectedPage();
+    const workers = page.workers();
+
+    if (!fnString) {
+      if (workers.length === 0) {
+        response.appendResponseLine('No workers attached to the selected page.');
+        return;
+      }
+      response.appendResponseLine(`${workers.length} worker(s) attached:`);
+      for (let i = 0; i < workers.length; i++) {
+        response.appendResponseLine(`  [${i}] ${workers[i].url()}`);
+      }
+      return;
+    }
+
+    if (workers.length === 0) {
+      response.appendResponseLine('No workers attached to the selected page.');
+      return;
+    }
+
+    let target = workers[0];
+    if (workerUrlFilter) {
+      const f = workerUrlFilter.toLowerCase();
+      const match = workers.find(w => w.url().toLowerCase().includes(f));
+      if (!match) {
+        response.appendResponseLine(`No worker matched filter ${JSON.stringify(workerUrlFilter)}.`);
+        response.appendResponseLine('Attached workers:');
+        for (const w of workers) response.appendResponseLine(`  ${w.url()}`);
+        return;
+      }
+      target = match;
+    } else if (workers.length > 1) {
+      response.appendResponseLine(
+        `Note: ${workers.length} workers attached, picking the first (${workers[0].url()}). Pass workerUrlFilter to disambiguate.`,
+      );
+    }
+
+    try {
+      const result = await withTimeout(
+        target.evaluate(async (fn: string) => {
+          // eslint-disable-next-line @typescript-eslint/no-implied-eval
+          const out = await (new Function('return (' + fn + ')()'))();
+          try {
+            return JSON.stringify(out);
+          } catch {
+            return String(out);
+          }
+        }, fnString),
+        DEFAULT_SCRIPT_TIMEOUT,
+        'Worker evaluation timed out',
+      );
+      response.appendResponseLine(`Worker (${target.url()}) returned:`);
+      response.appendResponseLine('```json');
+      response.appendResponseLine(String(result));
+      response.appendResponseLine('```');
+    } catch (e) {
+      response.appendResponseLine(`Worker eval error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  },
+});
