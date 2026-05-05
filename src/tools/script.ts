@@ -264,15 +264,10 @@ Example with arguments: \`(el) => {
   },
 });
 
-// evaluate_in_worker fills the gap that's most painful for v3 reCAPTCHA /
-// antibot reverse engineering: the env_proto serialization, LCG cipher, and
-// most other "interesting" code runs in a Web Worker, not the page main
-// thread. evaluate_script can't see that scope. This tool lists workers,
-// optionally filters by URL substring, and evaluates a function in the
-// chosen worker context.
+
 export const evaluateInWorker = defineTool({
   name: 'evaluate_in_worker',
-  description: `Evaluate a JS function inside a Web Worker on the selected page. Use this when the code you care about runs in a worker (reCAPTCHA env_proto serialization + LCG cipher, many antibot SDKs, service workers etc) — evaluate_script's main/isolated worlds don't reach worker scope. Pass workerUrlFilter to pick a specific worker by URL substring; otherwise the first worker is used. Lists available workers when no function is supplied.`,
+  description: `Evaluate a JS function inside a Web Worker on the selected page. Use this when the code you care about runs in a worker. evaluate_script's main/isolated worlds don't reach worker scope. Pass workerUrlFilter to pick a specific worker by URL substring; otherwise the first worker is used. Lists available workers when no function is supplied.`,
   annotations: {
     category: ToolCategory.DEBUGGING,
     readOnlyHint: false,
